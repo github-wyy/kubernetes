@@ -102,6 +102,8 @@ type Cache interface {
 	// It returns a clone of updated NodeInfo object.
 	UpdateNode(logger klog.Logger, oldNode, newNode *v1.Node) *framework.NodeInfo
 
+	GetNode(logger klog.Logger, nodeName string) *framework.NodeInfo
+
 	// RemoveNode removes overall information about node.
 	RemoveNode(logger klog.Logger, node *v1.Node) error
 

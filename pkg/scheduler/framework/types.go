@@ -21,7 +21,9 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -528,6 +530,268 @@ type QueuedPodInfo struct {
 	// GatingPluginEvents records the events registered by the plugin that gated the Pod at PreEnqueue.
 	// We have it as a cache purpose to avoid re-computing which event(s) might ungate the Pod.
 	GatingPluginEvents []fwk.ClusterEvent
+
+	shardInfo *ShardInfo
+}
+
+type ShardInfo struct {
+	mu sync.Mutex // 保护 status 的并发访问
+
+	ShardSchedulerIndex *int64
+
+	SchedulingCount int64
+	PreemptCount    int64
+
+	status *fwk.Status
+}
+
+// todo:
+func (s ShardInfo) DeepCopy() *ShardInfo {
+	ssi := s.ShardSchedulerIndex
+	// ensure the index pointer is non-nil when copying
+	i := new(int64)
+	if ssi != nil {
+		*i = *ssi
+	}
+
+	return &ShardInfo{
+		ShardSchedulerIndex: i,
+		SchedulingCount:     s.SchedulingCount,
+		PreemptCount:        s.PreemptCount,
+	}
+}
+
+func (pqi *QueuedPodInfo) GetShardSchedulingCount() int64 {
+	pqi.ensureShardInfo()
+	return pqi.shardInfo.SchedulingCount
+}
+
+func (pqi *QueuedPodInfo) GetShardPreemptCount() int64 {
+	pqi.ensureShardInfo()
+	return pqi.shardInfo.PreemptCount
+}
+
+func (pqi *QueuedPodInfo) IsPodScheduledInAllShards(shard int) bool {
+	pqi.ensureShardInfo()
+	return pqi.shardInfo.SchedulingCount >= int64(shard)
+}
+
+func (pqi *QueuedPodInfo) IsPodPreemptedInAllShards(shard int) bool {
+	pqi.ensureShardInfo()
+	return pqi.shardInfo.PreemptCount >= int64(shard)
+}
+
+func (pqi *QueuedPodInfo) GetShardStatus() *fwk.Status {
+	pqi.ensureShardInfo()
+	pqi.shardInfo.mu.Lock()
+	defer pqi.shardInfo.mu.Unlock()
+	return pqi.shardInfo.status
+}
+
+func (pqi *QueuedPodInfo) IncrementSchedulingCount() {
+	pqi.ensureShardInfo()
+	atomic.AddInt64(&pqi.shardInfo.SchedulingCount, 1)
+}
+
+func (pqi *QueuedPodInfo) IncrementPreemptCount() {
+	pqi.ensureShardInfo()
+	atomic.AddInt64(&pqi.shardInfo.PreemptCount, 1)
+}
+
+// ensureShardInfo lazily initializes shardInfo and its ShardSchedulerIndex.
+func (pqi *QueuedPodInfo) ensureShardInfo() {
+	if pqi.shardInfo == nil {
+		var idx = new(int64)
+		*idx = -1
+		pqi.shardInfo = &ShardInfo{ShardSchedulerIndex: idx}
+		return
+	}
+}
+
+func (pqi *QueuedPodInfo) HasShardSchedulerIndex() (*int64, bool) {
+	if pqi.shardInfo == nil {
+		return nil, false
+	}
+	if pqi.shardInfo.ShardSchedulerIndex == nil {
+		return nil, false
+	}
+	if *pqi.shardInfo.ShardSchedulerIndex == -1 {
+		return nil, false
+	}
+	return pqi.shardInfo.ShardSchedulerIndex, true
+}
+
+func (pqi *QueuedPodInfo) GetShardSchedulerIndex() *int64 {
+	pqi.ensureShardInfo()
+	return pqi.shardInfo.ShardSchedulerIndex
+}
+
+func (pqi *QueuedPodInfo) NextShardSchedulerIndex(shardNum int64) *int64 {
+	pqi.ensureShardInfo()
+
+	// 原子地递增索引
+	newIdx := atomic.AddInt64(pqi.shardInfo.ShardSchedulerIndex, 1)
+	if newIdx >= shardNum {
+		// 尝试重置，如果失败说明其他 goroutine 已经重置了
+		atomic.CompareAndSwapInt64(pqi.shardInfo.ShardSchedulerIndex, newIdx, 0)
+		newIdx = 0
+	}
+
+	return &newIdx
+}
+
+func (pqi *QueuedPodInfo) SetShardSchedulerIndex(idx int64) {
+	pqi.ensureShardInfo()
+	atomic.StoreInt64(pqi.shardInfo.ShardSchedulerIndex, idx)
+	return
+}
+
+// mergePostFilterMessages merges two PostFilter messages (typically from preemption)
+// and reconstructs the message with the correct total node count.
+// PostFilter messages typically have the format: "preemption: 0/X nodes are available: <reasons>"
+func mergePostFilterMessages(existing, new string, totalNodes int) string {
+	// Extract reasons from both messages by removing the "preemption: 0/X nodes are available: " prefix
+	extractReasons := func(msg string) map[string]int {
+		reasons := make(map[string]int)
+		// Find the position after "nodes are available: "
+		prefix := "nodes are available: "
+		idx := strings.Index(msg, prefix)
+		if idx == -1 {
+			return reasons
+		}
+		reasonsPart := msg[idx+len(prefix):]
+		// Remove trailing period if present
+		reasonsPart = strings.TrimSuffix(reasonsPart, ".")
+
+		// Parse reasons like "2 Insufficient cpu, 1 No preemption victims found"
+		parts := strings.Split(reasonsPart, ", ")
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			// Split by first space to get count and reason
+			spaceIdx := strings.Index(part, " ")
+			if spaceIdx > 0 {
+				countStr := part[:spaceIdx]
+				reason := part[spaceIdx+1:]
+				if count, err := strconv.Atoi(countStr); err == nil {
+					reasons[reason] += count
+				}
+			}
+		}
+		return reasons
+	}
+
+	// Merge reasons from both messages
+	mergedReasons := extractReasons(existing)
+	for reason, count := range extractReasons(new) {
+		mergedReasons[reason] += count
+	}
+
+	// Reconstruct the message with the correct total node count
+	if len(mergedReasons) == 0 {
+		return existing
+	}
+
+	var reasonStrs []string
+	for reason, count := range mergedReasons {
+		reasonStrs = append(reasonStrs, fmt.Sprintf("%d %s", count, reason))
+	}
+	sort.Strings(reasonStrs)
+
+	return fmt.Sprintf("preemption: 0/%d nodes are available: %s.", totalNodes, strings.Join(reasonStrs, ", "))
+}
+
+// todo: 逻辑完善
+func (pqi *QueuedPodInfo) AppendStatus(status *fwk.Status) {
+	pqi.ensureShardInfo()
+
+	// 加锁保护并发访问
+	pqi.shardInfo.mu.Lock()
+	defer pqi.shardInfo.mu.Unlock()
+
+	if pqi.shardInfo.status == nil {
+		pqi.shardInfo.status = status
+		return
+	}
+
+	// If the new status contains a FitError, we need to merge it with the existing one
+	if newErr := status.AsError(); newErr != nil {
+		if newFitError, ok := newErr.(*FitError); ok {
+			// Check if the existing status also has a FitError
+			if existingErr := pqi.shardInfo.status.AsError(); existingErr != nil {
+				if existingFitError, ok := existingErr.(*FitError); ok {
+					// Merge NodeToStatus maps first
+					if newFitError.Diagnosis.NodeToStatus != nil {
+						newFitError.Diagnosis.NodeToStatus.ForEachExplicitNode(func(nodeName string, nodeStatus *fwk.Status) {
+							existingFitError.Diagnosis.NodeToStatus.Set(nodeName, nodeStatus)
+						})
+					}
+
+					// Update NumAllNodes to reflect the actual number of unique nodes evaluated
+					// NumAllNodes should be the count of nodes in NodeToStatus, not the sum across shards
+					existingFitError.NumAllNodes = existingFitError.Diagnosis.NodeToStatus.Len()
+
+					// Merge UnschedulablePlugins
+					if newFitError.Diagnosis.UnschedulablePlugins != nil {
+						if existingFitError.Diagnosis.UnschedulablePlugins == nil {
+							existingFitError.Diagnosis.UnschedulablePlugins = sets.New[string]()
+						}
+						existingFitError.Diagnosis.UnschedulablePlugins = existingFitError.Diagnosis.UnschedulablePlugins.Union(newFitError.Diagnosis.UnschedulablePlugins)
+					}
+
+					// Merge PendingPlugins
+					if newFitError.Diagnosis.PendingPlugins != nil {
+						if existingFitError.Diagnosis.PendingPlugins == nil {
+							existingFitError.Diagnosis.PendingPlugins = sets.New[string]()
+						}
+						existingFitError.Diagnosis.PendingPlugins = existingFitError.Diagnosis.PendingPlugins.Union(newFitError.Diagnosis.PendingPlugins)
+					}
+
+					// Merge PreFilterMsg
+					if newFitError.Diagnosis.PreFilterMsg != "" {
+						if existingFitError.Diagnosis.PreFilterMsg == "" {
+							existingFitError.Diagnosis.PreFilterMsg = newFitError.Diagnosis.PreFilterMsg
+						} else if existingFitError.Diagnosis.PreFilterMsg != newFitError.Diagnosis.PreFilterMsg {
+							existingFitError.Diagnosis.PreFilterMsg += "; " + newFitError.Diagnosis.PreFilterMsg
+						}
+					}
+
+					// Merge PostFilterMsg
+					// Note: PostFilterMsg from preemption contains node counts from individual shards
+					// We need to reconstruct it to reflect the total node count across all shards
+					if newFitError.Diagnosis.PostFilterMsg != "" {
+						if existingFitError.Diagnosis.PostFilterMsg == "" {
+							// First time setting PostFilterMsg, but we need to update the node count
+							// to reflect the accumulated nodes from all shards
+							existingFitError.Diagnosis.PostFilterMsg = mergePostFilterMessages(
+								"",
+								newFitError.Diagnosis.PostFilterMsg,
+								existingFitError.NumAllNodes,
+							)
+						} else {
+							// Both messages exist, we need to merge them intelligently
+							// Extract and merge the preemption reasons from both messages
+							// This handles both cases: same and different messages
+							existingFitError.Diagnosis.PostFilterMsg = mergePostFilterMessages(
+								existingFitError.Diagnosis.PostFilterMsg,
+								newFitError.Diagnosis.PostFilterMsg,
+								existingFitError.NumAllNodes,
+							)
+						}
+					}
+
+					return
+				}
+			}
+		}
+	}
+
+	// Fallback: just append reasons if we can't merge FitErrors
+	for _, r := range status.Reasons() {
+		pqi.shardInfo.status.AppendReason(r)
+	}
 }
 
 func (pqi *QueuedPodInfo) GetPodInfo() fwk.PodInfo {
@@ -581,6 +845,11 @@ func (pqi *QueuedPodInfo) Gated() bool {
 
 // DeepCopy returns a deep copy of the QueuedPodInfo object.
 func (pqi *QueuedPodInfo) DeepCopy() *QueuedPodInfo {
+	var shardCopy *ShardInfo
+	if pqi.shardInfo != nil {
+		shardCopy = pqi.shardInfo.DeepCopy()
+	}
+
 	return &QueuedPodInfo{
 		PodInfo:                 pqi.PodInfo.DeepCopy(),
 		Timestamp:               pqi.Timestamp,
@@ -593,6 +862,7 @@ func (pqi *QueuedPodInfo) DeepCopy() *QueuedPodInfo {
 		GatingPluginEvents:      slices.Clone(pqi.GatingPluginEvents),
 		PendingPlugins:          pqi.PendingPlugins.Clone(),
 		ConsecutiveErrorsCount:  pqi.ConsecutiveErrorsCount,
+		shardInfo:               shardCopy,
 	}
 }
 

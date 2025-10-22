@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -61,8 +62,11 @@ func (sched *Scheduler) addNodeToCache(obj interface{}) {
 	}
 
 	logger.V(3).Info("Add event for node", "node", klog.KObj(node))
-	nodeInfo := sched.Cache.AddNode(logger, node)
-	sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(logger, evt, nil, node, preCheckForNode(nodeInfo))
+
+	idx := atomic.AddInt64(sched.nodeMaintainer.nextNodeShardIdx, 1) % sched.shardNum
+	ni := sched.ShardSchedulers[idx].Cache.AddNode(logger, node)
+
+	sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(logger, evt, nil, node, preCheckForNode(ni))
 }
 
 func (sched *Scheduler) updateNodeInCache(oldObj, newObj interface{}) {
@@ -80,7 +84,14 @@ func (sched *Scheduler) updateNodeInCache(oldObj, newObj interface{}) {
 	}
 
 	logger.V(4).Info("Update event for node", "node", klog.KObj(newNode))
-	nodeInfo := sched.Cache.UpdateNode(logger, oldNode, newNode)
+	var nodeInfo *framework.NodeInfo
+	for i := 0; i < int(sched.shardNum); i++ {
+		if ni := sched.ShardSchedulers[i].Cache.GetNode(logger, newNode.Name); ni != nil {
+			nodeInfo = sched.ShardSchedulers[i].Cache.UpdateNode(logger, oldNode, newNode)
+			break
+		}
+	}
+
 	events := framework.NodeSchedulingPropertiesChange(newNode, oldNode)
 
 	// Save the time it takes to update the node in the cache.
@@ -121,8 +132,13 @@ func (sched *Scheduler) deleteNodeFromCache(obj interface{}) {
 	sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(logger, evt, node, nil, nil)
 
 	logger.V(3).Info("Delete event for node", "node", klog.KObj(node))
-	if err := sched.Cache.RemoveNode(logger, node); err != nil {
-		utilruntime.HandleErrorWithLogger(logger, err, "Scheduler cache RemoveNode failed")
+	for i := 0; i < int(sched.shardNum); i++ {
+		if ni := sched.ShardSchedulers[i].Cache.GetNode(logger, node.Name); ni != nil {
+			if err := sched.ShardSchedulers[i].Cache.RemoveNode(logger, node); err != nil {
+				utilruntime.HandleErrorWithLogger(logger, err, "Scheduler cache RemoveNode failed")
+			}
+			break
+		}
 	}
 }
 
@@ -173,9 +189,16 @@ func (sched *Scheduler) updatePodInSchedulingQueue(oldObj, newObj interface{}) {
 		_ = sched.syncPodWithDispatcher(newPod)
 	}
 
-	isAssumed, err := sched.Cache.IsAssumedPod(newPod)
-	if err != nil {
-		utilruntime.HandleErrorWithLogger(logger, err, "Failed to check whether pod is assumed", "pod", klog.KObj(newPod))
+	var isAssumed = false
+	var err error = nil
+	for i := 0; i < int(sched.shardNum); i++ {
+		isAssumed, err = sched.ShardSchedulers[i].Cache.IsAssumedPod(newPod)
+		if err != nil {
+			utilruntime.HandleErrorWithLogger(logger, err, "Failed to check whether pod is assumed", "pod", klog.KObj(newPod))
+		}
+		if isAssumed {
+			break
+		}
 	}
 	if isAssumed {
 		return
@@ -218,24 +241,27 @@ func (sched *Scheduler) deletePodFromSchedulingQueue(obj interface{}) {
 
 	logger.V(3).Info("Delete event for unscheduled pod", "pod", klog.KObj(pod))
 	sched.SchedulingQueue.Delete(pod)
-	fwk, err := sched.frameworkForPod(pod)
+	fwks, err := sched.frameworkForPod(pod)
 	if err != nil {
 		// This shouldn't happen, because we only accept for scheduling the pods
 		// which specify a scheduler name that matches one of the profiles.
 		utilruntime.HandleErrorWithLogger(logger, err, "Unable to get profile", "pod", klog.KObj(pod))
 		return
 	}
-	// If a waiting pod is rejected, it indicates it's previously assumed and we're
-	// removing it from the scheduler cache. In this case, signal a AssignedPodDelete
-	// event to immediately retry some unscheduled Pods.
-	// Similarly when a pod that had nominated node is deleted, it can unblock scheduling of other pods,
-	// because the lower or equal priority pods treat such a pod as if it was assigned.
-	if fwk.RejectWaitingPod(pod.UID) {
-		sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(logger, framework.EventAssignedPodDelete, pod, nil, nil)
-	} else if pod.Status.NominatedNodeName != "" {
-		// Note that a nominated pod can fall into `RejectWaitingPod` case as well,
-		// but in that case the `MoveAllToActiveOrBackoffQueue` already covered lower priority pods.
-		sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(logger, framework.EventAssignedPodDelete, pod, nil, getLEPriorityPreCheck(corev1helpers.PodPriority(pod)))
+
+	for _, f := range fwks {
+		// If a waiting pod is rejected, it indicates it's previously assumed and we're
+		// removing it from the scheduler cache. In this case, signal a AssignedPodDelete
+		// event to immediately retry some unscheduled Pods.
+		// Similarly when a pod that had nominated node is deleted, it can unblock scheduling of other pods,
+		// because the lower or equal priority pods treat such a pod as if it was assigned.
+		if f.RejectWaitingPod(pod.UID) {
+			sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(logger, framework.EventAssignedPodDelete, pod, nil, nil)
+		} else if pod.Status.NominatedNodeName != "" {
+			// Note that a nominated pod can fall into `RejectWaitingPod` case as well,
+			// but in that case the `MoveAllToActiveOrBackoffQueue` already covered lower priority pods.
+			sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(logger, framework.EventAssignedPodDelete, pod, nil, getLEPriorityPreCheck(corev1helpers.PodPriority(pod)))
+		}
 	}
 }
 
@@ -258,8 +284,13 @@ func (sched *Scheduler) addPodToCache(obj interface{}) {
 	}
 
 	logger.V(3).Info("Add event for scheduled pod", "pod", klog.KObj(pod))
-	if err := sched.Cache.AddPod(logger, pod); err != nil {
-		utilruntime.HandleErrorWithLogger(logger, err, "Scheduler cache AddPod failed", "pod", klog.KObj(pod))
+	for i := 0; i < int(sched.shardNum); i++ {
+		if node := sched.ShardSchedulers[i].Cache.GetNode(logger, pod.Spec.NodeName); node != nil {
+			if err := sched.ShardSchedulers[i].Cache.AddPod(logger, pod); err != nil {
+				utilruntime.HandleErrorWithLogger(logger, err, "Scheduler cache AddPod failed", "pod", klog.KObj(pod))
+			}
+			break
+		}
 	}
 
 	// SchedulingQueue.AssignedPodAdded has a problem:
@@ -301,8 +332,13 @@ func (sched *Scheduler) updatePodInCache(oldObj, newObj interface{}) {
 	}
 
 	logger.V(4).Info("Update event for scheduled pod", "pod", klog.KObj(oldPod))
-	if err := sched.Cache.UpdatePod(logger, oldPod, newPod); err != nil {
-		utilruntime.HandleErrorWithLogger(logger, err, "Scheduler cache UpdatePod failed", "pod", klog.KObj(oldPod))
+	for i := 0; i < int(sched.shardNum); i++ {
+		if node := sched.ShardSchedulers[i].Cache.GetNode(logger, newPod.Spec.NodeName); node != nil {
+			if err := sched.ShardSchedulers[i].Cache.UpdatePod(logger, oldPod, newPod); err != nil {
+				utilruntime.HandleErrorWithLogger(logger, err, "Scheduler cache UpdatePod failed", "pod", klog.KObj(oldPod))
+			}
+			break
+		}
 	}
 
 	events := framework.PodSchedulingPropertiesChange(newPod, oldPod)
@@ -353,8 +389,13 @@ func (sched *Scheduler) deletePodFromCache(obj interface{}) {
 	}
 
 	logger.V(3).Info("Delete event for scheduled pod", "pod", klog.KObj(pod))
-	if err := sched.Cache.RemovePod(logger, pod); err != nil {
-		utilruntime.HandleErrorWithLogger(logger, err, "Scheduler cache RemovePod failed", "pod", klog.KObj(pod))
+	for i := 0; i < int(sched.shardNum); i++ {
+		if node := sched.ShardSchedulers[i].Cache.GetNode(logger, pod.Spec.NodeName); node != nil {
+			if err := sched.ShardSchedulers[i].Cache.RemovePod(logger, pod); err != nil {
+				utilruntime.HandleErrorWithLogger(logger, err, "Scheduler cache RemovePod failed", "pod", klog.KObj(pod))
+			}
+			break
+		}
 	}
 
 	sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(logger, framework.EventAssignedPodDelete, pod, nil, nil)
@@ -366,7 +407,7 @@ func assignedPod(pod *v1.Pod) bool {
 }
 
 // responsibleForPod returns true if the pod has asked to be scheduled by the given scheduler.
-func responsibleForPod(pod *v1.Pod, profiles profile.Map) bool {
+func responsibleForPod(pod *v1.Pod, profiles profile.MapForShard) bool {
 	return profiles.HandlesSchedulerName(pod.Spec.SchedulerName)
 }
 

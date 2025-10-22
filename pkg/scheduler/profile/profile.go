@@ -36,19 +36,19 @@ type RecorderFactory func(string) events.EventRecorder
 
 // newProfile builds a Profile for the given configuration.
 func newProfile(ctx context.Context, cfg config.KubeSchedulerProfile, r frameworkruntime.Registry, recorderFact RecorderFactory,
-	opts ...frameworkruntime.Option) (framework.Framework, error) {
+	opts ...frameworkruntime.Option) ([]framework.Framework, error) {
 	recorder := recorderFact(cfg.SchedulerName)
 	opts = append(opts, frameworkruntime.WithEventRecorder(recorder))
-	return frameworkruntime.NewFramework(ctx, r, &cfg, opts...)
+	return frameworkruntime.NewFrameworks(ctx, r, &cfg, opts...)
 }
 
 // Map holds frameworks indexed by scheduler name.
-type Map map[string]framework.Framework
+type MapForShard map[string][]framework.Framework
 
 // NewMap builds the frameworks given by the configuration, indexed by name.
 func NewMap(ctx context.Context, cfgs []config.KubeSchedulerProfile, r frameworkruntime.Registry, recorderFact RecorderFactory,
-	opts ...frameworkruntime.Option) (Map, error) {
-	m := make(Map)
+	opts ...frameworkruntime.Option) (MapForShard, error) {
+	m := make(MapForShard)
 	v := cfgValidator{m: m}
 
 	for _, cfg := range cfgs {
@@ -64,19 +64,20 @@ func NewMap(ctx context.Context, cfgs []config.KubeSchedulerProfile, r framework
 	return m, nil
 }
 
-// HandlesSchedulerName returns whether a profile handles the given scheduler name.
-func (m Map) HandlesSchedulerName(name string) bool {
+// HandlesSchedulerName returns whether a profile handles the given scheduler name for shard map.
+func (m MapForShard) HandlesSchedulerName(name string) bool {
 	_, ok := m[name]
 	return ok
 }
 
-// Close closes all frameworks registered in this map.
-func (m Map) Close() error {
+// Close closes all frameworks registered in this shard-aware map.
+func (m MapForShard) Close() error {
 	var errs []error
-	for name, f := range m {
-		err := f.Close()
-		if err != nil {
-			errs = append(errs, fmt.Errorf("framework %s failed to close: %w", name, err))
+	for name, fws := range m {
+		for _, f := range fws {
+			if err := f.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("framework %s failed to close: %w", name, err))
+			}
 		}
 	}
 	return errors.Join(errs...)
@@ -90,23 +91,28 @@ func NewRecorderFactory(b events.EventBroadcaster) RecorderFactory {
 }
 
 type cfgValidator struct {
-	m             Map
+	m             MapForShard
 	queueSort     string
 	queueSortArgs runtime.Object
 }
 
-func (v *cfgValidator) validate(cfg config.KubeSchedulerProfile, f framework.Framework) error {
-	if len(f.ProfileName()) == 0 {
+func (v *cfgValidator) validate(cfg config.KubeSchedulerProfile, frameworks []framework.Framework) error {
+	if len(frameworks) == 0 {
+		return errors.New("at least one framework per shard is needed")
+	}
+	// Use the first shard's framework as representative for validation.
+	rep := frameworks[0]
+	if len(rep.ProfileName()) == 0 {
 		return errors.New("scheduler name is needed")
 	}
 	if cfg.Plugins == nil {
-		return fmt.Errorf("plugins required for profile with scheduler name %q", f.ProfileName())
+		return fmt.Errorf("plugins required for profile with scheduler name %q", rep.ProfileName())
 	}
-	if v.m[f.ProfileName()] != nil {
-		return fmt.Errorf("duplicate profile with scheduler name %q", f.ProfileName())
+	if v.m[rep.ProfileName()] != nil {
+		return fmt.Errorf("duplicate profile with scheduler name %q", rep.ProfileName())
 	}
 
-	queueSort := f.ListPlugins().QueueSort.Enabled[0].Name
+	queueSort := rep.ListPlugins().QueueSort.Enabled[0].Name
 	var queueSortArgs runtime.Object
 	for _, plCfg := range cfg.PluginConfig {
 		if plCfg.Name == queueSort {

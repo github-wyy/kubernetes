@@ -133,7 +133,6 @@ type frameworkOptions struct {
 	eventRecorder          events.EventRecorder
 	informerFactory        informers.SharedInformerFactory
 	sharedDRAManager       framework.SharedDRAManager
-	snapshotSharedLister   framework.SharedLister
 	metricsRecorder        *metrics.MetricAsyncRecorder
 	podNominator           framework.PodNominator
 	podActivator           framework.PodActivator
@@ -143,6 +142,8 @@ type frameworkOptions struct {
 	waitingPods            *waitingPodsMap
 	apiDispatcher          *apidispatcher.APIDispatcher
 	logger                 *klog.Logger
+
+	snapshotSharedListers []framework.SharedLister
 }
 
 // Option for the frameworkImpl.
@@ -193,10 +194,9 @@ func WithSharedDRAManager(sharedDRAManager framework.SharedDRAManager) Option {
 	}
 }
 
-// WithSnapshotSharedLister sets the SharedLister of the snapshot.
-func WithSnapshotSharedLister(snapshotSharedLister framework.SharedLister) Option {
+func WithSnapshotSharedListers(snapshotSharedListers []framework.SharedLister) Option {
 	return func(o *frameworkOptions) {
-		o.snapshotSharedLister = snapshotSharedLister
+		o.snapshotSharedListers = snapshotSharedListers
 	}
 }
 
@@ -276,142 +276,149 @@ func defaultFrameworkOptions(stopCh <-chan struct{}) frameworkOptions {
 var _ framework.Framework = &frameworkImpl{}
 
 // NewFramework initializes plugins given the configuration and the registry.
-func NewFramework(ctx context.Context, r Registry, profile *config.KubeSchedulerProfile, opts ...Option) (framework.Framework, error) {
+func NewFrameworks(ctx context.Context, r Registry, profile *config.KubeSchedulerProfile, opts ...Option) ([]framework.Framework, error) {
 	options := defaultFrameworkOptions(ctx.Done())
 	for _, opt := range opts {
 		opt(&options)
 	}
 
-	logger := klog.FromContext(ctx)
-	if options.logger != nil {
-		logger = *options.logger
-	}
-	f := &frameworkImpl{
-		registry:             r,
-		snapshotSharedLister: options.snapshotSharedLister,
-		scorePluginWeight:    make(map[string]int),
-		waitingPods:          options.waitingPods,
-		clientSet:            options.clientSet,
-		kubeConfig:           options.kubeConfig,
-		eventRecorder:        options.eventRecorder,
-		informerFactory:      options.informerFactory,
-		sharedDRAManager:     options.sharedDRAManager,
-		metricsRecorder:      options.metricsRecorder,
-		extenders:            options.extenders,
-		PodNominator:         options.podNominator,
-		PodActivator:         options.podActivator,
-		apiDispatcher:        options.apiDispatcher,
-		parallelizer:         options.parallelizer,
-		logger:               logger,
-	}
-
-	if len(f.extenders) > 0 {
-		// Extender doesn't support any kind of requeueing feature like EnqueueExtensions in the scheduling framework.
-		// We register a defaultEnqueueExtension to framework.ExtenderName here.
-		// And, in the scheduling cycle, when Extenders reject some Nodes and the pod ends up being unschedulable,
-		// we put framework.ExtenderName to pInfo.UnschedulablePlugins.
-		f.enqueueExtensions = []framework.EnqueueExtensions{&defaultEnqueueExtension{pluginName: framework.ExtenderName}}
-	}
-
-	if profile == nil {
-		return f, nil
-	}
-
-	f.profileName = profile.SchedulerName
-	f.percentageOfNodesToScore = profile.PercentageOfNodesToScore
-	if profile.Plugins == nil {
-		return f, nil
-	}
-
-	// get needed plugins from config
-	pg := f.pluginsNeeded(profile.Plugins)
-
-	pluginConfig := make(map[string]runtime.Object, len(profile.PluginConfig))
-	for i := range profile.PluginConfig {
-		name := profile.PluginConfig[i].Name
-		if _, ok := pluginConfig[name]; ok {
-			return nil, fmt.Errorf("repeated config for plugin %s", name)
+	fwks := make([]framework.Framework, len(options.snapshotSharedListers))
+	for i := 0; i < len(options.snapshotSharedListers); i++ {
+		logger := klog.FromContext(ctx)
+		if options.logger != nil {
+			logger = *options.logger
 		}
-		pluginConfig[name] = profile.PluginConfig[i].Args
-	}
-	outputProfile := config.KubeSchedulerProfile{
-		SchedulerName:            f.profileName,
-		PercentageOfNodesToScore: f.percentageOfNodesToScore,
-		Plugins:                  profile.Plugins,
-		PluginConfig:             make([]config.PluginConfig, 0, len(pg)),
-	}
+		f := &frameworkImpl{
+			registry:             r,
+			snapshotSharedLister: options.snapshotSharedListers[i],
+			scorePluginWeight:    make(map[string]int),
+			waitingPods:          options.waitingPods,
+			clientSet:            options.clientSet,
+			kubeConfig:           options.kubeConfig,
+			eventRecorder:        options.eventRecorder,
+			informerFactory:      options.informerFactory,
+			sharedDRAManager:     options.sharedDRAManager,
+			metricsRecorder:      options.metricsRecorder,
+			extenders:            options.extenders,
+			PodNominator:         options.podNominator,
+			PodActivator:         options.podActivator,
+			apiDispatcher:        options.apiDispatcher,
+			parallelizer:         options.parallelizer,
+			logger:               logger,
+		}
 
-	f.pluginsMap = make(map[string]framework.Plugin)
-	for name, factory := range r {
-		// initialize only needed plugins.
-		if !pg.Has(name) {
+		if len(f.extenders) > 0 {
+			// Extender doesn't support any kind of requeueing feature like EnqueueExtensions in the scheduling framework.
+			// We register a defaultEnqueueExtension to fwk.ExtenderName here.
+			// And, in the scheduling cycle, when Extenders reject some Nodes and the pod ends up being unschedulable,
+			// we put fwk.ExtenderName to pInfo.UnschedulablePlugins.
+			f.enqueueExtensions = []framework.EnqueueExtensions{&defaultEnqueueExtension{pluginName: framework.ExtenderName}}
+		}
+
+		if profile == nil {
+			fwks[i] = f
 			continue
 		}
 
-		args := pluginConfig[name]
-		if args != nil {
-			outputProfile.PluginConfig = append(outputProfile.PluginConfig, config.PluginConfig{
-				Name: name,
-				Args: args,
-			})
+		f.profileName = profile.SchedulerName
+		f.percentageOfNodesToScore = profile.PercentageOfNodesToScore
+		if profile.Plugins == nil {
+			fwks[i] = f
+			continue
 		}
-		p, err := factory(ctx, args, f)
-		if err != nil {
-			return nil, fmt.Errorf("initializing plugin %q: %w", name, err)
+
+		// get needed plugins from config
+		pg := f.pluginsNeeded(profile.Plugins)
+
+		pluginConfig := make(map[string]runtime.Object, len(profile.PluginConfig))
+		for i := range profile.PluginConfig {
+			name := profile.PluginConfig[i].Name
+			if _, ok := pluginConfig[name]; ok {
+				return nil, fmt.Errorf("repeated config for plugin %s", name)
+			}
+			pluginConfig[name] = profile.PluginConfig[i].Args
 		}
-		f.pluginsMap[name] = p
+		outputProfile := config.KubeSchedulerProfile{
+			SchedulerName:            f.profileName,
+			PercentageOfNodesToScore: f.percentageOfNodesToScore,
+			Plugins:                  profile.Plugins,
+			PluginConfig:             make([]config.PluginConfig, 0, len(pg)),
+		}
 
-		f.fillEnqueueExtensions(p)
-	}
+		f.pluginsMap = make(map[string]framework.Plugin)
+		for name, factory := range r {
+			// initialize only needed plugins.
+			if !pg.Has(name) {
+				continue
+			}
 
-	// initialize plugins per individual extension points
-	for _, e := range f.getExtensionPoints(profile.Plugins) {
-		if err := updatePluginList(e.slicePtr, *e.plugins, f.pluginsMap); err != nil {
+			args := pluginConfig[name]
+			if args != nil {
+				outputProfile.PluginConfig = append(outputProfile.PluginConfig, config.PluginConfig{
+					Name: name,
+					Args: args,
+				})
+			}
+			p, err := factory(ctx, args, f)
+			if err != nil {
+				return nil, fmt.Errorf("initializing plugin %q: %w", name, err)
+			}
+			f.pluginsMap[name] = p
+
+			f.fillEnqueueExtensions(p)
+		}
+
+		// initialize plugins per individual extension points
+		for _, e := range f.getExtensionPoints(profile.Plugins) {
+			if err := updatePluginList(e.slicePtr, *e.plugins, f.pluginsMap); err != nil {
+				return nil, err
+			}
+		}
+
+		// initialize multiPoint plugins to their expanded extension points
+		if len(profile.Plugins.MultiPoint.Enabled) > 0 {
+			if err := f.expandMultiPointPlugins(logger, profile); err != nil {
+				return nil, err
+			}
+		}
+
+		if len(f.queueSortPlugins) != 1 {
+			return nil, fmt.Errorf("only one queue sort plugin required for profile with scheduler name %q, but got %d", profile.SchedulerName, len(f.queueSortPlugins))
+		}
+		if len(f.bindPlugins) == 0 {
+			return nil, fmt.Errorf("at least one bind plugin is needed for profile with scheduler name %q", profile.SchedulerName)
+		}
+
+		if err := getScoreWeights(f, append(profile.Plugins.Score.Enabled, profile.Plugins.MultiPoint.Enabled...)); err != nil {
 			return nil, err
 		}
-	}
 
-	// initialize multiPoint plugins to their expanded extension points
-	if len(profile.Plugins.MultiPoint.Enabled) > 0 {
-		if err := f.expandMultiPointPlugins(logger, profile); err != nil {
-			return nil, err
+		// Verifying the score weights again since Plugin.Name() could return a different
+		// value from the one used in the configuration.
+		for _, scorePlugin := range f.scorePlugins {
+			if f.scorePluginWeight[scorePlugin.Name()] == 0 {
+				return nil, fmt.Errorf("score plugin %q is not configured with weight", scorePlugin.Name())
+			}
 		}
-	}
 
-	if len(f.queueSortPlugins) != 1 {
-		return nil, fmt.Errorf("only one queue sort plugin required for profile with scheduler name %q, but got %d", profile.SchedulerName, len(f.queueSortPlugins))
-	}
-	if len(f.bindPlugins) == 0 {
-		return nil, fmt.Errorf("at least one bind plugin is needed for profile with scheduler name %q", profile.SchedulerName)
-	}
-
-	if err := getScoreWeights(f, append(profile.Plugins.Score.Enabled, profile.Plugins.MultiPoint.Enabled...)); err != nil {
-		return nil, err
-	}
-
-	// Verifying the score weights again since Plugin.Name() could return a different
-	// value from the one used in the configuration.
-	for _, scorePlugin := range f.scorePlugins {
-		if f.scorePluginWeight[scorePlugin.Name()] == 0 {
-			return nil, fmt.Errorf("score plugin %q is not configured with weight", scorePlugin.Name())
+		if options.captureProfile != nil {
+			if len(outputProfile.PluginConfig) != 0 {
+				sort.Slice(outputProfile.PluginConfig, func(i, j int) bool {
+					return outputProfile.PluginConfig[i].Name < outputProfile.PluginConfig[j].Name
+				})
+			} else {
+				outputProfile.PluginConfig = nil
+			}
+			options.captureProfile(outputProfile)
 		}
+
+		// Logs Enabled Plugins at each extension point, taking default plugins, given config, and multipoint into consideration
+		logger.V(2).Info("the scheduler starts to work with those plugins", "Plugins", *f.ListPlugins())
+		f.setInstrumentedPlugins()
+		fwks[i] = f
 	}
 
-	if options.captureProfile != nil {
-		if len(outputProfile.PluginConfig) != 0 {
-			sort.Slice(outputProfile.PluginConfig, func(i, j int) bool {
-				return outputProfile.PluginConfig[i].Name < outputProfile.PluginConfig[j].Name
-			})
-		} else {
-			outputProfile.PluginConfig = nil
-		}
-		options.captureProfile(outputProfile)
-	}
-
-	// Logs Enabled Plugins at each extension point, taking default plugins, given config, and multipoint into consideration
-	logger.V(2).Info("the scheduler starts to work with those plugins", "Plugins", *f.ListPlugins())
-	f.setInstrumentedPlugins()
-	return f, nil
+	return fwks, nil
 }
 
 // setInstrumentedPlugins initializes instrumented plugins from current plugins that frameworkImpl has.

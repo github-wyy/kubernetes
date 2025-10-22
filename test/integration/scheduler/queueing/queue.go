@@ -2538,7 +2538,7 @@ func RunTestCoreResourceEnqueue(t *testing.T, tt *CoreResourceEnqueueTestCase) {
 
 	// Pop all pods out. They should become unschedulable.
 	for i := 0; i < len(tt.Pods); i++ {
-		testCtx.Scheduler.ScheduleOne(testCtx.Ctx)
+		testCtx.Scheduler.DispatchOne(testCtx.Ctx)
 	}
 	// Wait for the tt.Pods to be still present in the scheduling (unschedulable) queue.
 	if err := wait.PollUntilContextTimeout(ctx, time.Millisecond*200, wait.ForeverTestTimeout, false, func(ctx context.Context) (bool, error) {

@@ -946,7 +946,12 @@ func TestAsyncPreemption(t *testing.T) {
 						}
 
 						preemptionDoneChannels[scenario.schedulePod.podName] = make(chan struct{})
+<<<<<<< Updated upstream
 						testCtx.Scheduler.ScheduleOne(testCtx.Ctx)
+=======
+						lock.Unlock()
+						testCtx.Scheduler.DispatchOne(testCtx.Ctx)
+>>>>>>> Stashed changes
 						if scenario.schedulePod.expectSuccess {
 							if err := wait.PollUntilContextTimeout(testCtx.Ctx, 200*time.Millisecond, wait.ForeverTestTimeout, false, testutils.PodScheduled(cs, testCtx.NS.Name, scenario.schedulePod.podName)); err != nil {
 								t.Fatalf("Expected the pod %s to be scheduled", scenario.schedulePod.podName)

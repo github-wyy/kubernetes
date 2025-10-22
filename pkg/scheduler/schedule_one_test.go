@@ -1123,7 +1123,7 @@ func TestSchedulerScheduleOne(t *testing.T) {
 						}
 						informerFactory.Start(ctx.Done())
 						informerFactory.WaitForCacheSync(ctx.Done())
-						sched.ScheduleOne(ctx)
+						sched.DispatchOne(ctx)
 
 						if item.podToAdmit != nil {
 							for {
@@ -1480,7 +1480,7 @@ func TestScheduleOneMarksPodAsProcessedBeforePreBind(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					sched.ScheduleOne(ctx)
+					sched.DispatchOne(ctx)
 					<-called
 
 					if diff := cmp.Diff(item.expectAssumedPod, gotAssumedPod); diff != "" {
@@ -1630,7 +1630,7 @@ func TestSchedulerNoPhantomPodAfterExpire(t *testing.T) {
 			if err := queuedPodStore.Add(secondPod); err != nil {
 				t.Fatal(err)
 			}
-			scheduler.ScheduleOne(ctx)
+			scheduler.DispatchOne(ctx)
 			select {
 			case b := <-bindingChan:
 				expectBinding := &v1.Binding{
@@ -1683,7 +1683,7 @@ func TestSchedulerNoPhantomPodAfterDelete(t *testing.T) {
 			// queuedPodStore: [bar:8080]
 			// cache: [(assumed)foo:8080]
 
-			scheduler.ScheduleOne(ctx)
+			scheduler.DispatchOne(ctx)
 			select {
 			case err := <-errChan:
 				expectErr := &framework.FitError{
@@ -1720,7 +1720,7 @@ func TestSchedulerNoPhantomPodAfterDelete(t *testing.T) {
 			if err := queuedPodStore.Add(secondPod); err != nil {
 				t.Fatal(err)
 			}
-			scheduler.ScheduleOne(ctx)
+			scheduler.DispatchOne(ctx)
 			select {
 			case b := <-bindingChan:
 				expectBinding := &v1.Binding{
@@ -1811,7 +1811,7 @@ func TestSchedulerFailedSchedulingReasons(t *testing.T) {
 			if err := queuedPodStore.Add(podWithTooBigResourceRequests); err != nil {
 				t.Fatal(err)
 			}
-			scheduler.ScheduleOne(ctx)
+			scheduler.DispatchOne(ctx)
 			select {
 			case err := <-errChan:
 				expectErr := &framework.FitError{
@@ -1944,7 +1944,7 @@ func TestSchedulerWithVolumeBinding(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				s.ScheduleOne(ctx)
+				s.DispatchOne(ctx)
 				// Wait for pod to succeed or fail scheduling
 				select {
 				case <-eventChan:
@@ -3553,7 +3553,10 @@ func TestFindFitAllError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, diagnosis, err := scheduler.findNodesThatFitPod(ctx, schedFramework, framework.NewCycleState(), &v1.Pod{})
+	podInfo := &framework.QueuedPodInfo{}
+	podInfo.Pod = &v1.Pod{}
+	_, diagnosis, err := scheduler.findNodesThatFitPod(ctx, schedFramework, framework.NewCycleState(), podInfo)
+
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -3598,8 +3601,11 @@ func TestFindFitSomeError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pod := st.MakePod().Name("1").UID("1").Obj()
-	_, diagnosis, err := scheduler.findNodesThatFitPod(ctx, fwk, framework.NewCycleState(), pod)
+	// todo: 测试文件需要修改，当前podInfo中没有分片信息
+	podInfo := &framework.QueuedPodInfo{}
+	podInfo.Pod = st.MakePod().Name("1").UID("1").Obj()
+	pod := podInfo.Pod
+	_, diagnosis, err := scheduler.findNodesThatFitPod(ctx, fwk, framework.NewCycleState(), podInfo)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -3627,19 +3633,24 @@ func TestFindFitSomeError(t *testing.T) {
 }
 
 func TestFindFitPredicateCallCounts(t *testing.T) {
+	podInfo_0 := &framework.QueuedPodInfo{}
+	podInfo_0.Pod = st.MakePod().Name("1").UID("1").Priority(highPriority).Obj()
+	podInfo_1 := &framework.QueuedPodInfo{}
+	podInfo_1.Pod = st.MakePod().Name("1").UID("1").Priority(lowPriority).Obj()
+
 	tests := []struct {
 		name          string
-		pod           *v1.Pod
+		pod           *framework.QueuedPodInfo
 		expectedCount int32
 	}{
 		{
 			name:          "nominated pods have lower priority, predicate is called once",
-			pod:           st.MakePod().Name("1").UID("1").Priority(highPriority).Obj(),
+			pod:           podInfo_0,
 			expectedCount: 1,
 		},
 		{
 			name:          "nominated pods have higher priority, predicate is called twice",
-			pod:           st.MakePod().Name("1").UID("1").Priority(lowPriority).Obj(),
+			pod:           podInfo_1,
 			expectedCount: 2,
 		},
 	}
@@ -3833,7 +3844,9 @@ func TestZeroRequest(t *testing.T) {
 			sched.applyDefaultHandlers()
 
 			state := framework.NewCycleState()
-			_, _, err = sched.findNodesThatFitPod(ctx, fwk, state, test.pod)
+			podInfo := &framework.QueuedPodInfo{}
+			podInfo.Pod = test.pod
+			_, _, err = sched.findNodesThatFitPod(ctx, fwk, state, podInfo)
 			if err != nil {
 				t.Fatalf("error filtering nodes: %+v", err)
 			}
@@ -4364,7 +4377,9 @@ func TestFairEvaluationForNodes(t *testing.T) {
 
 	// Iterating over all nodes more than twice
 	for i := 0; i < 2*(numAllNodes/nodesToFind+1); i++ {
-		nodesThatFit, _, err := sched.findNodesThatFitPod(ctx, fwk, framework.NewCycleState(), &v1.Pod{})
+		podInfo := &framework.QueuedPodInfo{}
+		podInfo.Pod = &v1.Pod{}
+		nodesThatFit, _, err := sched.findNodesThatFitPod(ctx, fwk, framework.NewCycleState(), podInfo)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -4448,7 +4463,9 @@ func TestPreferNominatedNodeFilterCallCounts(t *testing.T) {
 			}
 			sched.applyDefaultHandlers()
 
-			_, _, err = sched.findNodesThatFitPod(ctx, fwk, framework.NewCycleState(), test.pod)
+			podInfo := &framework.QueuedPodInfo{}
+			podInfo.Pod = test.pod
+			_, _, err = sched.findNodesThatFitPod(ctx, fwk, framework.NewCycleState(), podInfo)
 			if err != nil {
 				t.Errorf("unexpected error: %v", err)
 			}
@@ -4554,7 +4571,7 @@ func setupTestSchedulerWithOnePodOnNode(ctx context.Context, t *testing.T, clien
 	// queuedPodStore: [foo:8080]
 	// cache: []
 
-	scheduler.ScheduleOne(ctx)
+	scheduler.DispatchOne(ctx)
 	// queuedPodStore: []
 	// cache: [(assumed)foo:8080]
 

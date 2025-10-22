@@ -17,6 +17,7 @@ limitations under the License.
 package scheduler
 
 import (
+	"container/heap"
 	"context"
 	"errors"
 	"fmt"
@@ -70,9 +71,16 @@ var ErrNoNodesAvailable = fmt.Errorf("no nodes available to schedule pods")
 // Scheduler watches for new unscheduled pods. It attempts to find
 // nodes that they fit on and writes bindings back to the api server.
 type Scheduler struct {
-	// It is expected that changes made via Cache will be observed
-	// by NodeLister and Algorithm.
-	Cache internalcache.Cache
+	// scheduler
+	shardNum int64 // 分片数量
+
+	// dispacther
+	PodDispacther *PodDispacther
+
+	nodeMaintainer *NodeMaintainer // todo: 平衡各分片 node数量
+
+	// shardSchedulers
+	ShardSchedulers []*ShardScheduler
 
 	Extenders []framework.Extender
 
@@ -85,16 +93,11 @@ type Scheduler struct {
 	// FailureHandler is called upon a scheduling failure.
 	FailureHandler FailureHandlerFn
 
-	// SchedulePod tries to schedule the given pod to one of the nodes in the node list.
-	// Return a struct of ScheduleResult with the name of suggested host on success,
-	// otherwise will return a FitError with reasons.
-	SchedulePod func(ctx context.Context, fwk framework.Framework, state fwk.CycleState, pod *v1.Pod) (ScheduleResult, error)
-
 	// Close this to shut down the scheduler.
 	StopEverything <-chan struct{}
 
 	// SchedulingQueue holds pods to be scheduled
-	SchedulingQueue internalqueue.SchedulingQueue
+	SchedulingQueue internalqueue.SchedulingQueue // todo：【考虑是否需要】为提升调度性能，可集成到PodDispacther中，一个分片对应一个。eventhandler 中add pod时，分发到一个优先级队列，然后 pop分发到各分片对应的queue
 
 	// If possible, indirect operation on APIDispatcher, e.g. through SchedulingQueue, is preferred.
 	// Is nil iff SchedulerAsyncAPICalls feature gate is disabled.
@@ -103,15 +106,11 @@ type Scheduler struct {
 	APIDispatcher *apidispatcher.APIDispatcher
 
 	// Profiles are the scheduling profiles.
-	Profiles profile.Map
+	Profiles profile.MapForShard
 
 	client clientset.Interface
 
-	nodeInfoSnapshot *internalcache.Snapshot
-
 	percentageOfNodesToScore int32
-
-	nextStartNodeIndex int
 
 	// logger *must* be initialized when creating a Scheduler,
 	// otherwise logging functions will access a nil sink and
@@ -124,9 +123,35 @@ type Scheduler struct {
 	nominatedNodeNameForExpectationEnabled bool
 }
 
+type PodDispacther struct {
+	chanShardToScheduler  chan *framework.QueuedPodInfo
+	chanGlobalToScheduler chan *framework.QueuedPodInfo
+
+	shardPodIdx *int64 // 用来决定下次pop pod后应该分给哪一个调度器分片
+
+	// 维护一个优先级队列，保存 分片调度器中调度/抢占失败的 pod，用于分发给其他分片调度器
+	ShardSchedulingQueue heap.Interface
+	ChanToShardScheduler []chan *framework.QueuedPodInfo
+}
+
+type NodeMaintainer struct {
+	nextNodeShardIdx *int64 // 用来决定下次add node时应该放到哪一个分片的chches
+}
+
+type ShardScheduler struct {
+	Scheduler *Scheduler
+
+	Cache              internalcache.Cache // 分片对应的cache
+	nodeInfoSnapshot   *internalcache.Snapshot
+	nextStartNodeIndex int
+	SchedulePod        func(ctx context.Context, fwk framework.Framework, state fwk.CycleState, podInfo *framework.QueuedPodInfo) (ScheduleResult, error)
+}
+
 func (sched *Scheduler) applyDefaultHandlers() {
-	sched.SchedulePod = sched.schedulePod
 	sched.FailureHandler = sched.handleSchedulingFailure
+	for _, shardScheduler := range sched.ShardSchedulers {
+		shardScheduler.SchedulePod = shardScheduler.schedulePod
+	}
 }
 
 type schedulerOptions struct {
@@ -314,7 +339,13 @@ func New(ctx context.Context,
 	podLister := informerFactory.Core().V1().Pods().Lister()
 	nodeLister := informerFactory.Core().V1().Nodes().Lister()
 
-	snapshot := internalcache.NewEmptySnapshot()
+	snapshots := make([]*internalcache.Snapshot, 0)
+	snapshotListers := make([]framework.SharedLister, 0)
+	for i := 0; i < 3; i++ { // todo: 配置
+		snapshots = append(snapshots, internalcache.NewEmptySnapshot())
+		snapshotListers = append(snapshotListers, snapshots[i])
+	}
+
 	metricsRecorder := metrics.NewMetricsAsyncRecorder(1000, time.Second, stopEverything)
 	// waitingPods holds all the pods that are in the scheduler and waiting in the permit stage
 	waitingPods := frameworkruntime.NewWaitingPodsMap()
@@ -354,7 +385,7 @@ func New(ctx context.Context,
 		frameworkruntime.WithKubeConfig(options.kubeConfig),
 		frameworkruntime.WithInformerFactory(informerFactory),
 		frameworkruntime.WithSharedDRAManager(draManager),
-		frameworkruntime.WithSnapshotSharedLister(snapshot),
+		frameworkruntime.WithSnapshotSharedListers(snapshotListers),
 		frameworkruntime.WithCaptureProfile(frameworkruntime.CaptureProfile(options.frameworkCapturer)),
 		frameworkruntime.WithParallelism(int(options.parallelism)),
 		frameworkruntime.WithExtenders(extenders),
@@ -373,14 +404,16 @@ func New(ctx context.Context,
 	preEnqueuePluginMap := make(map[string]map[string]framework.PreEnqueuePlugin)
 	queueingHintsPerProfile := make(internalqueue.QueueingHintMapPerProfile)
 	var returnErr error
-	for profileName, profile := range profiles {
-		plugins := profile.PreEnqueuePlugins()
+	for profileName, fwks := range profiles {
+		// Use the first shard's framework as representative for global queueing hints and pre-enqueue plugins.
+		f := fwks[0]
+		plugins := f.PreEnqueuePlugins()
 		preEnqueuePluginMap[profileName] = make(map[string]framework.PreEnqueuePlugin, len(plugins))
 		for _, plugin := range plugins {
 			preEnqueuePluginMap[profileName][plugin.Name()] = plugin
 		}
 
-		queueingHintsPerProfile[profileName], err = buildQueueingHintMap(ctx, profile.EnqueueExtensions())
+		queueingHintsPerProfile[profileName], err = buildQueueingHintMap(ctx, f.EnqueueExtensions())
 		if err != nil {
 			returnErr = errors.Join(returnErr, err)
 		}
@@ -391,7 +424,7 @@ func New(ctx context.Context,
 	}
 
 	podQueue := internalqueue.NewSchedulingQueue(
-		profiles[options.profiles[0].SchedulerName].QueueSortFunc(),
+		profiles[options.profiles[0].SchedulerName][0].QueueSortFunc(),
 		informerFactory,
 		internalqueue.WithClock(options.clock),
 		internalqueue.WithPodInitialBackoffDuration(time.Duration(options.podInitialBackoffSeconds)*time.Second),
@@ -412,20 +445,44 @@ func New(ctx context.Context,
 		apiCache = apicache.New(podQueue, schedulerCache)
 	}
 
-	for _, fwk := range profiles {
-		fwk.SetPodNominator(podQueue)
-		fwk.SetPodActivator(podQueue)
-		fwk.SetAPICacher(apiCache)
+	for _, fwks := range profiles {
+		for _, f := range fwks {
+			f.SetPodNominator(podQueue)
+			f.SetPodActivator(podQueue)
+			f.SetAPICacher(apiCache)
+		}
 	}
 
 	// Setup cache debugger.
 	debugger := cachedebugger.New(nodeLister, podLister, schedulerCache, podQueue)
 	debugger.ListenForSignal(ctx)
 
+	// 分片相关
+	// 分发pod的channel
+	dispactherChans := make([]chan *framework.QueuedPodInfo, 0)
+	for i := 0; i < 3; i++ { // todo: 配置
+		ch := make(chan *framework.QueuedPodInfo, 10) // todo 配置
+		dispactherChans = append(dispactherChans, ch)
+	}
+	// 分片调度器
+	shardSchedulers := make([]*ShardScheduler, 3)
+
 	sched := &Scheduler{
-		Cache:                                  schedulerCache,
+		// 分片相关
+		shardNum:        3, // todo: 配置
+		ShardSchedulers: shardSchedulers,
+		PodDispacther: &PodDispacther{
+			shardPodIdx:           new(int64),
+			chanShardToScheduler:  make(chan *framework.QueuedPodInfo, 1),
+			chanGlobalToScheduler: make(chan *framework.QueuedPodInfo, 1),
+			ShardSchedulingQueue:  internalqueue.NewQueuedPodInfoHeap(profiles[options.profiles[0].SchedulerName][0].QueueSortFunc()),
+			ChanToShardScheduler:  dispactherChans,
+		},
+		nodeMaintainer: &NodeMaintainer{
+			nextNodeShardIdx: new(int64),
+		},
+
 		client:                                 client,
-		nodeInfoSnapshot:                       snapshot,
 		percentageOfNodesToScore:               options.percentageOfNodesToScore,
 		Extenders:                              extenders,
 		StopEverything:                         stopEverything,
@@ -434,6 +491,13 @@ func New(ctx context.Context,
 		logger:                                 logger,
 		APIDispatcher:                          apiDispatcher,
 		nominatedNodeNameForExpectationEnabled: feature.DefaultFeatureGate.Enabled(features.NominatedNodeNameForExpectation),
+	}
+	for i := 0; i < 3; i++ {
+		shardSchedulers[i] = &ShardScheduler{
+			Scheduler:        sched,
+			Cache:            internalcache.New(ctx, durationToExpireAssumedPod, apiDispatcher),
+			nodeInfoSnapshot: snapshots[i],
+		}
 	}
 	sched.NextPod = podQueue.Pop
 	sched.applyDefaultHandlers()
@@ -529,13 +593,18 @@ func (sched *Scheduler) Run(ctx context.Context) {
 		sched.APIDispatcher.Run(logger)
 	}
 
+	for i := 0; i < int(sched.shardNum); i++ {
+		go sched.ShardSchedule(ctx, i)
+	}
+	go sched.DispatcherRun(ctx)
+
 	// We need to start scheduleOne loop in a dedicated goroutine,
 	// because scheduleOne function hangs on getting the next item
 	// from the SchedulingQueue.
 	// If there are no new pods to schedule, it will be hanging there
 	// and if done in this goroutine it will be blocking closing
 	// SchedulingQueue, in effect causing a deadlock on shutdown.
-	go wait.UntilWithContext(ctx, sched.ScheduleOne, 0)
+	go wait.UntilWithContext(ctx, sched.DispatchOne, 0)
 
 	<-ctx.Done()
 	if sched.APIDispatcher != nil {
@@ -548,6 +617,19 @@ func (sched *Scheduler) Run(ctx context.Context) {
 	if err != nil {
 		logger.Error(err, "Failed to close plugins")
 	}
+}
+
+func (sched *Scheduler) nextInShardSchedulingPod(logger klog.Logger) (*framework.QueuedPodInfo, error) {
+	pi := sched.PodDispacther.ShardSchedulingQueue.Pop() //阻塞
+	if pi == nil {
+		return nil, nil
+	}
+	podInfo, ok := pi.(*framework.QueuedPodInfo)
+	if !ok {
+		logger.Error(nil, "unexpected item type in ShardSchedulingQueue", "got", fmt.Sprintf("%T", pi))
+		return nil, nil
+	}
+	return podInfo, nil
 }
 
 // NewInformerFactory creates a SharedInformerFactory and initializes a scheduler specific

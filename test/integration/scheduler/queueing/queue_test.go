@@ -146,7 +146,7 @@ func TestSchedulingGates(t *testing.T) {
 
 			// Schedule pods.
 			for _, podName := range tt.schedule {
-				testCtx.Scheduler.ScheduleOne(testCtx.Ctx)
+				testCtx.Scheduler.DispatchOne(testCtx.Ctx)
 				if err := wait.PollUntilContextTimeout(ctx, time.Millisecond*200, wait.ForeverTestTimeout, false, testutils.PodScheduled(cs, ns, podName)); err != nil {
 					t.Fatalf("Failed to schedule %s", podName)
 				}
@@ -177,7 +177,7 @@ func TestSchedulingGates(t *testing.T) {
 
 			// Schedule pods which no longer have gates.
 			for _, podName := range tt.rmGates {
-				testCtx.Scheduler.ScheduleOne(testCtx.Ctx)
+				testCtx.Scheduler.DispatchOne(testCtx.Ctx)
 				if err := wait.PollUntilContextTimeout(ctx, time.Millisecond*200, wait.ForeverTestTimeout, false, testutils.PodScheduled(cs, ns, podName)); err != nil {
 					t.Fatalf("Failed to schedule %s", podName)
 				}

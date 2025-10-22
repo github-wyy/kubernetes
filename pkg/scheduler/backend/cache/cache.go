@@ -625,6 +625,18 @@ func (cache *cacheImpl) AddNode(logger klog.Logger, node *v1.Node) *framework.No
 	return n.info.SnapshotConcrete()
 }
 
+func (cache *cacheImpl) GetNode(logger klog.Logger, nodeName string) *framework.NodeInfo {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+
+	n, ok := cache.nodes[nodeName]
+	if !ok {
+		return nil
+	}
+
+	return n.info.SnapshotConcrete()
+}
+
 func (cache *cacheImpl) UpdateNode(logger klog.Logger, oldNode, newNode *v1.Node) *framework.NodeInfo {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
